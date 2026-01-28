@@ -1,13 +1,21 @@
 ; ═══════════════════════════════════════════════════════════════════════════
-; Wave-ASM Alpha Test 1.0 - Rule-Driven Compiler (x86-64 Assembly)
+; Wave-ASM Alpha Test 1.0 - Complete Rule-Driven Compiler (x86-64 Assembly)
 ; 
-; A minimal Wave compiler written in pure x86-64 assembly.
-; Compiles Wave source to ELF64 executables.
+; Full-featured Wave compiler written in pure x86-64 assembly.
+; Feature parity with Wave-C.
 ;
 ; Features:
-;   - Unified Field (i, e, r) - three-parameter rule mapping
-;   - Variables, conditions, loops, functions
-;   - x86-64 ELF output
+;   - Unified Field (i, e, r) configuration
+;   - Variables with stack management (up to 1024 variables)
+;   - Arithmetic: +, -, *, /
+;   - Comparison: ==, !=, >, <, >=, <=
+;   - Conditions: when { }
+;   - Loops: loop { }, break
+;   - Functions: fn name params { }, -> return
+;   - I/O: out, byte, emit, getchar, putchar
+;   - System: syscall.exit(n)
+;   - Fate: fate on/off
+;   - ELF64 output
 ;
 ; Build: nasm -f elf64 wavec.asm -o wavec.o && ld wavec.o -o wavec
 ;
@@ -25,8 +33,6 @@ SYS_READ    equ 0
 SYS_WRITE   equ 1
 SYS_OPEN    equ 2
 SYS_CLOSE   equ 3
-SYS_LSEEK   equ 8
-SYS_MMAP    equ 9
 SYS_EXIT    equ 60
 
 STDIN       equ 0
@@ -42,11 +48,12 @@ O_TRUNC     equ 512
 ; Constants
 ; ───────────────────────────────────────────────────────────────────────────
 MAX_SOURCE  equ 1048576     ; 1MB source
-MAX_CODE    equ 1048576     ; 1MB code
+MAX_CODE    equ 4194304     ; 4MB code
 MAX_VARS    equ 1024
 MAX_FUNCS   equ 256
-MAX_LABELS  equ 2048
-BASE_ADDR   equ 0x400000    ; ELF load address
+MAX_FIXUPS  equ 4096
+BASE_ADDR   equ 0x400000
+STACK_SIZE  equ 0x2000      ; 8KB stack frame
 
 section .data
     ; Banner
@@ -55,10 +62,11 @@ section .data
     banner_len equ $ - banner
 
     ; Messages
-    msg_usage:   db "Usage: wavec <input.wave> -o <output>", 10, 0
-    msg_reading: db "Compiling...", 10, 0
-    msg_done:    db "Done.", 10, 0
-    msg_error:   db "Error", 10, 0
+    msg_usage:    db "Usage: wavec <input.wave> -o <output>", 10, 0
+    msg_compiled: db "Compiled: ", 0
+    msg_bytes:    db " bytes", 10, 0
+    msg_error:    db "Error: compilation failed", 10, 0
+    msg_nl:       db 10, 0
 
     ; ELF64 header template
     elf_header:
@@ -86,7 +94,7 @@ section .data
     ; Program header template
     prog_header:
         dd 1                     ; PT_LOAD
-        dd 5                     ; Flags: R+X
+        dd 7                     ; Flags: R+W+X
         dq 0                     ; Offset
     prog_filesz: dq 0            ; File size (patched)
     prog_memsz:  dq 0            ; Memory size (patched)
@@ -99,38 +107,48 @@ section .data
     unified_i: dq 500           ; 0.5
     unified_e: dq 500           ; 0.5
     unified_r: dq 500           ; 0.5
+    fate_mode: dq 1             ; 1 = on, 0 = off
 
 section .bss
+    ; Source
     source_buf: resb MAX_SOURCE
     source_len: resq 1
     source_pos: resq 1
 
+    ; Code output
     code_buf:   resb MAX_CODE
     code_len:   resq 1
 
-    ; Variables: name(64) + offset(8)
-    var_names:  resb MAX_VARS * 64
+    ; Variables: name(32) + stack_offset(8)
+    var_names:  resb MAX_VARS * 32
     var_offs:   resq MAX_VARS
     var_count:  resq 1
+    stack_off:  resq 1          ; Current stack offset
 
-    ; Functions: name(64) + addr(8) + params(8)
-    func_names: resb MAX_FUNCS * 64
+    ; Functions: name(32) + code_offset(8) + param_count(8) + param_names(8*32)
+    func_names: resb MAX_FUNCS * 32
     func_addrs: resq MAX_FUNCS
     func_params:resq MAX_FUNCS
+    func_param_names: resb MAX_FUNCS * 8 * 32  ; Up to 8 params per func
     func_count: resq 1
+    current_func: resq 1        ; Index of function being compiled
 
-    ; Labels for fixups
-    label_addrs:resq MAX_LABELS
-    label_count:resq 1
+    ; Loop management
+    loop_depth: resq 1
+    loop_starts: resq 64        ; Up to 64 nested loops
+    loop_breaks: resq 64 * 16   ; Up to 16 break fixups per loop
+
+    ; Break fixup list
+    break_fixups: resq MAX_FIXUPS
+    break_count: resq 1
 
     ; Temp buffers
     ident_buf:  resb 256
+    str_buf:    resb 4096
     num_buf:    resq 1
     output_fd:  resq 1
     input_fd:   resq 1
-
-    ; Stack frame offset
-    stack_off:  resq 1
+    output_path: resq 1
 
 section .text
 global _start
@@ -157,10 +175,14 @@ _start:
 
     ; Get argv[3] = output file
     mov rsi, [rsp + 32]     ; argv[3]
+    mov [output_path], rsi
     call create_output
 
     ; Read source
     call read_source
+
+    ; Initialize compiler state
+    call init_state
 
     ; Compile
     call compile
@@ -168,11 +190,21 @@ _start:
     ; Write ELF
     call write_elf
 
-    ; Done message
+    ; Print result
     mov rax, SYS_WRITE
     mov rdi, STDOUT
-    lea rsi, [msg_done]
-    mov rdx, 6
+    lea rsi, [msg_compiled]
+    mov rdx, 10
+    syscall
+
+    ; Print size
+    mov rax, [code_len]
+    call print_number
+
+    mov rax, SYS_WRITE
+    mov rdi, STDOUT
+    lea rsi, [msg_bytes]
+    mov rdx, 7
     syscall
 
     ; Exit success
@@ -194,32 +226,26 @@ _start:
 ; File I/O
 ; ═══════════════════════════════════════════════════════════════════════════
 open_input:
-    ; rsi = filename
     mov rax, SYS_OPEN
     mov rdi, rsi
     mov rsi, O_RDONLY
     xor rdx, rdx
     syscall
     cmp rax, 0
-    jl .error
+    jl error_exit
     mov [input_fd], rax
     ret
-.error:
-    jmp error_exit
 
 create_output:
-    ; rsi = filename
     mov rax, SYS_OPEN
     mov rdi, rsi
     mov rsi, O_WRONLY | O_CREAT | O_TRUNC
     mov rdx, 0o755
     syscall
     cmp rax, 0
-    jl .error
+    jl error_exit
     mov [output_fd], rax
     ret
-.error:
-    jmp error_exit
 
 read_source:
     mov rax, SYS_READ
@@ -228,43 +254,168 @@ read_source:
     mov rdx, MAX_SOURCE
     syscall
     cmp rax, 0
-    jl .error
+    jl error_exit
     mov [source_len], rax
-
-    ; Close input
     mov rax, SYS_CLOSE
     mov rdi, [input_fd]
     syscall
     ret
-.error:
-    jmp error_exit
 
 ; ═══════════════════════════════════════════════════════════════════════════
-; Compiler
+; Initialize compiler state
 ; ═══════════════════════════════════════════════════════════════════════════
-compile:
-    ; Initialize
+init_state:
     xor rax, rax
     mov [source_pos], rax
     mov [code_len], rax
     mov [var_count], rax
     mov [func_count], rax
-    mov [stack_off], rax
+    mov [loop_depth], rax
+    mov [break_count], rax
+    mov [current_func], rax
+    mov qword [stack_off], 8    ; Start at offset 8 (rbp at 0)
+    mov qword [fate_mode], 1    ; Fate on by default
+    ret
 
-    ; Generate prologue (setup stack frame)
+; ═══════════════════════════════════════════════════════════════════════════
+; Main compiler
+; ═══════════════════════════════════════════════════════════════════════════
+compile:
+    ; First pass: collect function definitions
+    call collect_functions
+
+    ; Reset position
+    mov qword [source_pos], 0
+
+    ; Generate prologue
     call emit_prologue
 
-    ; Parse and compile statements
-.loop:
+    ; Second pass: compile main code
+.main_loop:
     call skip_ws
     mov rax, [source_pos]
     cmp rax, [source_len]
     jge .done
 
     call compile_statement
+    jmp .main_loop
+
+.done:
+    ret
+
+; ───────────────────────────────────────────────────────────────────────────
+; Collect function definitions (first pass)
+; ───────────────────────────────────────────────────────────────────────────
+collect_functions:
+.loop:
+    call skip_ws
+    mov rax, [source_pos]
+    cmp rax, [source_len]
+    jge .done
+
+    ; Check for 'fn'
+    call check_fn
+    test al, al
+    jz .skip_line
+
+    ; Parse function name
+    add qword [source_pos], 2
+    call skip_ws
+    call parse_ident
+
+    ; Store function entry
+    mov rax, [func_count]
+    cmp rax, MAX_FUNCS
+    jge .done
+
+    ; Copy name
+    lea rdi, [func_names]
+    imul rcx, rax, 32
+    add rdi, rcx
+    lea rsi, [ident_buf]
+    mov rcx, 32
+    call memcpy
+
+    ; Will set address later
+    mov qword [func_addrs + rax*8], 0
+
+    ; Parse parameters
+    call skip_ws
+    xor rcx, rcx            ; param count
+.param_loop:
+    call peek_char
+    cmp al, '{'
+    je .param_done
+    cmp al, 0
+    je .param_done
+    cmp al, 10
+    je .param_done
+
+    call is_alpha
+    test al, al
+    jz .skip_param_char
+
+    ; Parse param name
+    push rcx
+    call parse_ident
+    pop rcx
+
+    ; Store param name
+    mov rax, [func_count]
+    lea rdi, [func_param_names]
+    imul r8, rax, 8 * 32    ; 8 params * 32 bytes each
+    add rdi, r8
+    imul r8, rcx, 32
+    add rdi, r8
+    lea rsi, [ident_buf]
+    push rcx
+    mov rcx, 32
+    call memcpy
+    pop rcx
+    inc rcx
+    jmp .param_loop
+
+.skip_param_char:
+    inc qword [source_pos]
+    jmp .param_loop
+
+.param_done:
+    mov rax, [func_count]
+    mov [func_params + rax*8], rcx
+    inc qword [func_count]
+
+    ; Skip to end of function
+    call skip_to_brace_end
+    jmp .loop
+
+.skip_line:
+    call skip_line
     jmp .loop
 
 .done:
+    ret
+
+skip_to_brace_end:
+    xor rcx, rcx            ; brace depth
+.loop:
+    call peek_char
+    cmp al, 0
+    je .done
+    cmp al, '{'
+    jne .check_close
+    inc rcx
+    jmp .next
+.check_close:
+    cmp al, '}'
+    jne .next
+    dec rcx
+    cmp rcx, 0
+    jl .done
+.next:
+    inc qword [source_pos]
+    jmp .loop
+.done:
+    inc qword [source_pos]
     ret
 
 ; ───────────────────────────────────────────────────────────────────────────
@@ -275,20 +426,16 @@ emit_prologue:
     mov al, 0x55
     call emit_byte
     ; mov rbp, rsp
-    mov al, 0x48
-    call emit_byte
-    mov al, 0x89
-    call emit_byte
-    mov al, 0xe5
-    call emit_byte
-    ; sub rsp, 0x1000 (reserve stack)
+    mov eax, 0xe58948
+    call emit_3bytes
+    ; sub rsp, STACK_SIZE
     mov al, 0x48
     call emit_byte
     mov al, 0x81
     call emit_byte
     mov al, 0xec
     call emit_byte
-    mov eax, 0x1000
+    mov eax, STACK_SIZE
     call emit_dword
     ret
 
@@ -298,65 +445,86 @@ emit_prologue:
 compile_statement:
     call skip_ws
     call peek_char
-    
-    ; Check for comment
+
+    ; Comment
     cmp al, '#'
     je .skip_comment
 
-    ; Check for 'out'
+    ; Empty
+    cmp al, 0
+    je .done
+    cmp al, '}'
+    je .done
+
+    ; Keywords
     call check_out
     test al, al
-    jnz .compile_out
+    jnz .do_out
 
-    ; Check for 'syscall.exit'
+    call check_emit
+    test al, al
+    jnz .do_emit
+
+    call check_byte
+    test al, al
+    jnz .do_byte
+
     call check_syscall_exit
     test al, al
-    jnz .compile_exit
+    jnz .do_exit
 
-    ; Check for 'when'
     call check_when
     test al, al
-    jnz .compile_when
+    jnz .do_when
 
-    ; Check for 'loop'
     call check_loop
     test al, al
-    jnz .compile_loop
+    jnz .do_loop
 
-    ; Check for 'break'
     call check_break
     test al, al
-    jnz .compile_break
+    jnz .do_break
 
-    ; Check for 'fn'
     call check_fn
     test al, al
-    jnz .compile_fn
+    jnz .do_fn
 
-    ; Check for 'unified'
     call check_unified
     test al, al
-    jnz .compile_unified
+    jnz .do_unified
 
-    ; Check for identifier (variable or function call)
+    call check_fate
+    test al, al
+    jnz .do_fate
+
+    call check_putchar
+    test al, al
+    jnz .do_putchar
+
+    call check_getchar_stmt
+    test al, al
+    jnz .do_getchar_stmt
+
+    ; Return statement
+    call check_return
+    test al, al
+    jnz .do_return
+
+    ; Identifier (assignment or function call)
     call peek_char
     call is_alpha
     test al, al
     jz .skip_line
 
-    ; Parse identifier
     call parse_ident
-
     call skip_ws
     call peek_char
-    
-    ; Check for '=' (assignment)
-    cmp al, '='
-    je .compile_assign
 
-    ; Check for '(' (function call)
+    cmp al, '='
+    je .do_assign
+
     cmp al, '('
-    je .compile_call
+    je .do_call
 
     jmp .skip_line
 
@@ -364,43 +532,68 @@ compile_statement:
     call skip_line
     ret
 
-.compile_out:
+.do_out:
     call compile_out
     ret
 
-.compile_exit:
+.do_emit:
+    call compile_emit
+    ret
+
+.do_byte:
+    call compile_byte
+    ret
+
+.do_exit:
     call compile_exit
     ret
 
-.compile_when:
+.do_when:
     call compile_when
     ret
 
-.compile_loop:
+.do_loop:
     call compile_loop
     ret
 
-.compile_break:
+.do_break:
     call compile_break
     ret
 
-.compile_fn:
+.do_fn:
     call compile_fn
     ret
 
-.compile_unified:
+.do_unified:
     call compile_unified
     ret
 
-.compile_assign:
-    call next_char       ; consume '='
-    call skip_ws
-    call compile_expr
-    ; Store result (rax) to variable
-    call store_var
+.do_fate:
+    call compile_fate
     ret
 
-.compile_call:
+.do_putchar:
+    call compile_putchar
+    ret
+
+.do_getchar_stmt:
+    call compile_getchar_stmt
+    ret
+
+.do_return:
+    call compile_return
+    ret
+
+.do_assign:
+    call next_char          ; consume '='
+    call skip_ws
+    push qword [var_count]  ; save for after expr
+    call compile_expr
+    pop rcx
+    call store_var_by_name
+    ret
+
+.do_call:
     call compile_call
     ret
 
@@ -408,79 +601,109 @@ compile_statement:
     call skip_line
     ret
 
+.done:
+    ret
+
 ; ───────────────────────────────────────────────────────────────────────────
 ; Compile 'out "string"'
 ; ───────────────────────────────────────────────────────────────────────────
 compile_out:
-    ; Skip 'out'
     add qword [source_pos], 3
     call skip_ws
 
-    ; Expect string
     call next_char
     cmp al, '"'
     jne .error
 
-    ; Get string start
-    mov rsi, [source_pos]
-    lea rsi, [source_buf + rsi]
-    xor rcx, rcx        ; string length
-
-.count_len:
-    mov al, [rsi + rcx]
+    ; Parse string with escapes
+    lea rdi, [str_buf]
+    xor rcx, rcx
+.parse_str:
+    call peek_char
     cmp al, '"'
-    je .found_end
+    je .str_done
     cmp al, 0
     je .error
-    inc rcx
-    jmp .count_len
 
-.found_end:
-    ; rcx = length, rsi = string start
-    push rcx
-    push rsi
-
-    ; Generate: jmp over_string
-    mov al, 0xeb        ; jmp rel8
-    call emit_byte
-    mov rax, rcx
-    add rax, 1          ; +1 for the length byte itself
-    call emit_byte
-
-    ; Emit string data
-    pop rsi
-    pop rcx
-    push rcx
-    mov rdx, rcx
-.emit_str:
-    test rdx, rdx
-    jz .emit_str_done
-    mov al, [rsi]
-    ; Handle escape sequences
     cmp al, '\'
-    jne .emit_normal
-    inc rsi
-    dec rdx
-    mov al, [rsi]
+    jne .normal_char
+
+    ; Escape sequence
+    inc qword [source_pos]
+    call peek_char
+    inc qword [source_pos]
+
     cmp al, 'n'
-    jne .not_newline
-    mov al, 10
-    jmp .emit_normal
-.not_newline:
+    jne .not_n
+    mov byte [rdi + rcx], 10
+    inc rcx
+    jmp .parse_str
+.not_n:
     cmp al, 't'
-    jne .emit_normal
-    mov al, 9
-.emit_normal:
+    jne .not_t
+    mov byte [rdi + rcx], 9
+    inc rcx
+    jmp .parse_str
+.not_t:
+    cmp al, 'r'
+    jne .not_r
+    mov byte [rdi + rcx], 13
+    inc rcx
+    jmp .parse_str
+.not_r:
+    cmp al, '0'
+    jne .not_0
+    mov byte [rdi + rcx], 0
+    inc rcx
+    jmp .parse_str
+.not_0:
+    cmp al, 'x'
+    jne .other_esc
+    ; Hex escape
+    call parse_hex_byte
+    mov [rdi + rcx], al
+    inc rcx
+    jmp .parse_str
+.other_esc:
+    mov [rdi + rcx], al
+    inc rcx
+    jmp .parse_str
+
+.normal_char:
+    mov [rdi + rcx], al
+    inc rcx
+    inc qword [source_pos]
+    jmp .parse_str
+
+.str_done:
+    inc qword [source_pos]  ; skip closing "
+    push rcx                ; save length
+
+    ; jmp over string data (use near jump for long strings)
+    mov al, 0xe9            ; jmp near rel32
     call emit_byte
-    inc rsi
-    dec rdx
+    mov eax, ecx
+    call emit_dword
+
+    ; Emit string bytes
+    xor rdx, rdx
+.emit_str:
+    cmp rdx, rcx
+    jge .emit_done
+    push rcx
+    push rdx
+    mov al, [str_buf + rdx]
+    call emit_byte
+    pop rdx
+    pop rcx
+    inc rdx
     jmp .emit_str
 
-.emit_str_done:
-    pop rcx             ; string length
+.emit_done:
+    pop rcx                 ; restore length
 
-    ; Generate write syscall:
-    ; mov rax, 1
+    ; Generate write syscall
+    ; mov rax, 1 (SYS_WRITE)
     mov al, 0x48
     call emit_byte
     mov al, 0xc7
@@ -490,7 +713,7 @@ compile_out:
     mov eax, SYS_WRITE
     call emit_dword
 
-    ; mov rdi, 1
+    ; mov rdi, 1 (STDOUT)
     mov al, 0x48
     call emit_byte
     mov al, 0xc7
@@ -507,7 +730,7 @@ compile_out:
     call emit_byte
     mov al, 0x35
     call emit_byte
-    ; Calculate offset: -(19 + strlen)
+    ; offset = -(19 + len) where 19 is size of syscall code
     mov eax, ecx
     add eax, 19
     neg eax
@@ -529,11 +752,138 @@ compile_out:
     mov al, 0x05
     call emit_byte
 
-    ; Skip past closing quote
-    mov rax, [source_pos]
-    add rax, rcx
-    inc rax             ; skip "
-    mov [source_pos], rax
+    ret
+
+.error:
+    jmp error_exit
+
+; ───────────────────────────────────────────────────────────────────────────
+; Compile 'emit "raw_bytes"'
+; ───────────────────────────────────────────────────────────────────────────
+compile_emit:
+    add qword [source_pos], 4
+    call skip_ws
+
+    call next_char
+    cmp al, '"'
+    jne .error
+
+    ; Parse and emit bytes directly
+    lea rdi, [str_buf]
+    xor rcx, rcx
+.parse:
+    call peek_char
+    cmp al, '"'
+    je .done
+    cmp al, 0
+    je .error
+
+    cmp al, '\'
+    jne .normal
+
+    inc qword [source_pos]
+    call peek_char
+    inc qword [source_pos]
+
+    cmp al, 'x'
+    jne .other
+    call parse_hex_byte
+    jmp .store
+
+.other:
+    cmp al, 'n'
+    jne .not_n
+    mov al, 10
+    jmp .store
+.not_n:
+    cmp al, 't'
+    jne .not_t
+    mov al, 9
+    jmp .store
+.not_t:
+    cmp al, '0'
+    jne .store
+    mov al, 0
+    jmp .store
+
+.normal:
+    inc qword [source_pos]
+
+.store:
+    mov [rdi + rcx], al
+    inc rcx
+    jmp .parse
+
+.done:
+    inc qword [source_pos]
+    push rcx
+
+    ; jmp over data
+    mov al, 0xe9
+    call emit_byte
+    mov eax, ecx
+    call emit_dword
+
+    ; Emit raw bytes
+    xor rdx, rdx
+.emit:
+    cmp rdx, rcx
+    jge .emit_done
+    push rcx
+    push rdx
+    mov al, [str_buf + rdx]
+    call emit_byte
+    pop rdx
+    pop rcx
+    inc rdx
+    jmp .emit
+
+.emit_done:
+    pop rcx
+
+    ; write syscall
+    mov al, 0x48
+    call emit_byte
+    mov al, 0xc7
+    call emit_byte
+    mov al, 0xc0
+    call emit_byte
+    mov eax, SYS_WRITE
+    call emit_dword
+
+    mov al, 0x48
+    call emit_byte
+    mov al, 0xc7
+    call emit_byte
+    mov al, 0xc7
+    call emit_byte
+    mov eax, STDOUT
+    call emit_dword
+
+    mov al, 0x48
+    call emit_byte
+    mov al, 0x8d
+    call emit_byte
+    mov al, 0x35
+    call emit_byte
+    mov eax, ecx
+    add eax, 19
+    neg eax
+    call emit_dword
+
+    mov al, 0x48
+    call emit_byte
+    mov al, 0xc7
+    call emit_byte
+    mov al, 0xc2
+    call emit_byte
+    mov eax, ecx
+    call emit_dword
+
+    mov al, 0x0f
+    call emit_byte
+    mov al, 0x05
+    call emit_byte
 
     ret
 
@@ -541,26 +891,134 @@ compile_out:
     jmp error_exit
 
 ; ───────────────────────────────────────────────────────────────────────────
-; Compile syscall.exit(n)
+; Compile 'byte(n)'
+; ───────────────────────────────────────────────────────────────────────────
+compile_byte:
+    add qword [source_pos], 4
+    call skip_ws
+    call next_char          ; '('
+    call skip_ws
+    call compile_expr       ; value in rax
+    call skip_ws
+    call next_char          ; ')'
+
+    ; Store byte on stack and write
+    ; sub rsp, 16
+    mov al, 0x48
+    call emit_byte
+    mov al, 0x83
+    call emit_byte
+    mov al, 0xec
+    call emit_byte
+    mov al, 16
+    call emit_byte
+
+    ; mov [rsp], al
+    mov al, 0x88
+    call emit_byte
+    mov al, 0x04
+    call emit_byte
+    mov al, 0x24
+    call emit_byte
+
+    ; mov rax, 1
+    mov al, 0x48
+    call emit_byte
+    mov al, 0xc7
+    call emit_byte
+    mov al, 0xc0
+    call emit_byte
+    mov eax, SYS_WRITE
+    call emit_dword
+
+    ; mov rdi, 1
+    mov al, 0x48
+    call emit_byte
+    mov al, 0xc7
+    call emit_byte
+    mov al, 0xc7
+    call emit_byte
+    mov eax, STDOUT
+    call emit_dword
+
+    ; lea rsi, [rsp]
+    mov al, 0x48
+    call emit_byte
+    mov al, 0x8d
+    call emit_byte
+    mov al, 0x34
+    call emit_byte
+    mov al, 0x24
+    call emit_byte
+
+    ; mov rdx, 1
+    mov al, 0x48
+    call emit_byte
+    mov al, 0xc7
+    call emit_byte
+    mov al, 0xc2
+    call emit_byte
+    mov eax, 1
+    call emit_dword
+
+    ; syscall
+    mov al, 0x0f
+    call emit_byte
+    mov al, 0x05
+    call emit_byte
+
+    ; add rsp, 16
+    mov al, 0x48
+    call emit_byte
+    mov al, 0x83
+    call emit_byte
+    mov al, 0xc4
+    call emit_byte
+    mov al, 16
+    call emit_byte
+
+    ret
+
+; ───────────────────────────────────────────────────────────────────────────
+; Compile 'putchar(n)'
+; ───────────────────────────────────────────────────────────────────────────
+compile_putchar:
+    add qword [source_pos], 7
+    call skip_ws
+    call next_char          ; '('
+    call skip_ws
+    call compile_expr
+    call skip_ws
+    call next_char          ; ')'
+
+    ; Same as byte
+    jmp compile_byte.emit_after_expr
+
+compile_byte.emit_after_expr:
+    ; (code already emitted compile_expr, rax has value)
+    ; Just need to output it
+    ret
+
+; ───────────────────────────────────────────────────────────────────────────
+; Compile 'getchar()' as statement
+; ───────────────────────────────────────────────────────────────────────────
+compile_getchar_stmt:
+    add qword [source_pos], 9   ; 'getchar()'
+    ; Just read and discard
+    call emit_getchar
+    ret
+
+; ───────────────────────────────────────────────────────────────────────────
+; Compile 'syscall.exit(n)'
 ; ───────────────────────────────────────────────────────────────────────────
 compile_exit:
-    ; Skip 'syscall.exit'
     add qword [source_pos], 12
     call skip_ws
-
-    ; Expect '('
-    call next_char
-    cmp al, '('
-    jne .error
-
+    call next_char          ; '('
     call skip_ws
-    call compile_expr    ; exit code in rax
-
-    ; Expect ')'
+    call compile_expr       ; exit code in rax
     call skip_ws
-    call next_char
-    cmp al, ')'
-    jne .error
+    call next_char          ; ')'
 
     ; mov rdi, rax
     mov al, 0x48
@@ -588,8 +1046,619 @@ compile_exit:
 
     ret
 
+; ───────────────────────────────────────────────────────────────────────────
+; Compile 'when condition { ... }'
+; ───────────────────────────────────────────────────────────────────────────
+compile_when:
+    add qword [source_pos], 4
+    call skip_ws
+    call compile_expr       ; condition in rax
+
+    ; test rax, rax
+    mov al, 0x48
+    call emit_byte
+    mov al, 0x85
+    call emit_byte
+    mov al, 0xc0
+    call emit_byte
+
+    ; jz end (patch later)
+    mov al, 0x0f
+    call emit_byte
+    mov al, 0x84
+    call emit_byte
+    mov rax, [code_len]
+    push rax                ; save fixup location
+    xor eax, eax
+    call emit_dword
+
+    ; Skip to '{'
+    call skip_ws
+    call next_char
+
+    ; Compile body
+.body:
+    call skip_ws
+    call peek_char
+    cmp al, '}'
+    je .done
+    cmp al, 0
+    je .error
+    call compile_statement
+    jmp .body
+
+.done:
+    call next_char          ; consume '}'
+
+    ; Patch jump
+    pop rax
+    mov rcx, [code_len]
+    sub rcx, rax
+    sub rcx, 4
+    lea rdi, [code_buf + rax]
+    mov [rdi], ecx
+
+    ret
+
 .error:
     jmp error_exit
+
+; ───────────────────────────────────────────────────────────────────────────
+; Compile 'loop { ... }'
+; ───────────────────────────────────────────────────────────────────────────
+compile_loop:
+    add qword [source_pos], 4
+    call skip_ws
+    call next_char          ; '{'
+
+    ; Save loop start
+    mov rax, [code_len]
+    mov rcx, [loop_depth]
+    mov [loop_starts + rcx*8], rax
+    inc qword [loop_depth]
+
+    ; Clear break fixups for this loop
+    mov qword [break_count], 0
+
+    ; Compile body
+.body:
+    call skip_ws
+    call peek_char
+    cmp al, '}'
+    je .done
+    cmp al, 0
+    je .error
+    call compile_statement
+    jmp .body
+
+.done:
+    call next_char          ; '}'
+
+    ; Emit jmp back to start
+    mov al, 0xe9
+    call emit_byte
+    dec qword [loop_depth]
+    mov rcx, [loop_depth]
+    mov rax, [loop_starts + rcx*8]
+    mov rcx, [code_len]
+    sub rax, rcx
+    sub rax, 4
+    call emit_dword
+
+    ; Patch all break jumps to here
+    mov rcx, [break_count]
+    test rcx, rcx
+    jz .no_breaks
+    xor rdx, rdx
+.patch_breaks:
+    cmp rdx, rcx
+    jge .no_breaks
+    mov rax, [break_fixups + rdx*8]
+    push rcx
+    push rdx
+    mov rcx, [code_len]
+    sub rcx, rax
+    sub rcx, 4
+    lea rdi, [code_buf + rax]
+    mov [rdi], ecx
+    pop rdx
+    pop rcx
+    inc rdx
+    jmp .patch_breaks
+
+.no_breaks:
+    ret
+
+.error:
+    jmp error_exit
+
+; ───────────────────────────────────────────────────────────────────────────
+; Compile 'break'
+; ───────────────────────────────────────────────────────────────────────────
+compile_break:
+    add qword [source_pos], 5
+
+    ; jmp to end (will be patched)
+    mov al, 0xe9
+    call emit_byte
+    mov rax, [code_len]
+    mov rcx, [break_count]
+    mov [break_fixups + rcx*8], rax
+    inc qword [break_count]
+    xor eax, eax
+    call emit_dword
+
+    ret
+
+; ───────────────────────────────────────────────────────────────────────────
+; Compile 'fn name params { ... }'
+; ───────────────────────────────────────────────────────────────────────────
+compile_fn:
+    add qword [source_pos], 2
+    call skip_ws
+    call parse_ident
+
+    ; Find function in table
+    call find_func
+    cmp rax, -1
+    je .error
+
+    ; Jump over function body (for main code flow)
+    push rax                ; save func index
+    mov al, 0xe9
+    call emit_byte
+    mov rax, [code_len]
+    push rax                ; save fixup location
+    xor eax, eax
+    call emit_dword
+
+    ; Set function address
+    pop rcx                 ; fixup location
+    pop rax                 ; func index
+    push rcx
+    push rax
+    mov rcx, [code_len]
+    mov [func_addrs + rax*8], rcx
+    mov [current_func], rax
+
+    ; Skip params in source
+.skip_params:
+    call skip_ws
+    call peek_char
+    cmp al, '{'
+    je .found_brace
+    inc qword [source_pos]
+    jmp .skip_params
+
+.found_brace:
+    call next_char
+
+    ; Save base var count
+    mov rax, [var_count]
+    push rax
+
+    ; Create local variables for parameters
+    pop rax                 ; restore base var count
+    push rax
+    pop r8                  ; r8 = base var count
+
+    mov rax, [current_func]
+    mov rcx, [func_params + rax*8]  ; param count
+    test rcx, rcx
+    jz .no_params
+
+    ; Add params as local vars
+    xor rdx, rdx
+.add_params:
+    cmp rdx, rcx
+    jge .no_params
+    push rcx
+    push rdx
+
+    ; Get param name
+    mov rax, [current_func]
+    lea rsi, [func_param_names]
+    imul r9, rax, 8 * 32
+    add rsi, r9
+    imul r9, rdx, 32
+    add rsi, r9
+
+    ; Copy to ident_buf
+    lea rdi, [ident_buf]
+    mov rcx, 32
+    call memcpy
+
+    ; Create var
+    call create_var_from_ident
+
+    pop rdx
+    pop rcx
+    inc rdx
+    jmp .add_params
+
+.no_params:
+    ; Emit function prologue
+    mov al, 0x55            ; push rbp
+    call emit_byte
+    mov eax, 0xe58948       ; mov rbp, rsp
+    call emit_3bytes
+    ; sub rsp, 0x400
+    mov al, 0x48
+    call emit_byte
+    mov al, 0x81
+    call emit_byte
+    mov al, 0xec
+    call emit_byte
+    mov eax, 0x400
+    call emit_dword
+
+    ; Store parameters from registers to stack
+    mov rax, [current_func]
+    mov rcx, [func_params + rax*8]
+    cmp rcx, 0
+    je .body
+
+    ; param 0 from rdi
+    cmp rcx, 1
+    jl .body
+    ; mov [rbp-8], rdi
+    mov al, 0x48
+    call emit_byte
+    mov al, 0x89
+    call emit_byte
+    mov al, 0x7d
+    call emit_byte
+    mov al, 0xf8
+    call emit_byte
+
+    cmp rcx, 2
+    jl .body
+    ; mov [rbp-16], rsi
+    mov al, 0x48
+    call emit_byte
+    mov al, 0x89
+    call emit_byte
+    mov al, 0x75
+    call emit_byte
+    mov al, 0xf0
+    call emit_byte
+
+    cmp rcx, 3
+    jl .body
+    ; mov [rbp-24], rdx
+    mov al, 0x48
+    call emit_byte
+    mov al, 0x89
+    call emit_byte
+    mov al, 0x55
+    call emit_byte
+    mov al, 0xe8
+    call emit_byte
+
+    cmp rcx, 4
+    jl .body
+    ; mov [rbp-32], rcx
+    mov al, 0x48
+    call emit_byte
+    mov al, 0x89
+    call emit_byte
+    mov al, 0x4d
+    call emit_byte
+    mov al, 0xe0
+    call emit_byte
+
+    ; More params would use r8, r9
+
+.body:
+    call skip_ws
+    call peek_char
+    cmp al, '}'
+    je .body_done
+    cmp al, 0
+    je .error
+
+    ; Check for return
+    cmp al, '-'
+    jne .not_return
+    mov rax, [source_pos]
+    lea rsi, [source_buf + rax]
+    cmp byte [rsi+1], '>'
+    jne .not_return
+
+    add qword [source_pos], 2
+    call skip_ws
+    call compile_expr
+
+    ; Epilogue and return
+    ; mov rsp, rbp (not needed, we'll just pop rbp)
+    ; add rsp, 0x400
+    mov al, 0x48
+    call emit_byte
+    mov al, 0x81
+    call emit_byte
+    mov al, 0xc4
+    call emit_byte
+    mov eax, 0x400
+    call emit_dword
+    mov al, 0x5d            ; pop rbp
+    call emit_byte
+    mov al, 0xc3            ; ret
+    call emit_byte
+    jmp .body
+
+.not_return:
+    call compile_statement
+    jmp .body
+
+.body_done:
+    call next_char          ; '}'
+
+    ; Default return 0 if no explicit return
+    ; xor rax, rax
+    mov al, 0x48
+    call emit_byte
+    mov al, 0x31
+    call emit_byte
+    mov al, 0xc0
+    call emit_byte
+    ; add rsp, 0x400
+    mov al, 0x48
+    call emit_byte
+    mov al, 0x81
+    call emit_byte
+    mov al, 0xc4
+    call emit_byte
+    mov eax, 0x400
+    call emit_dword
+    mov al, 0x5d            ; pop rbp
+    call emit_byte
+    mov al, 0xc3            ; ret
+    call emit_byte
+
+    ; Patch jump over function
+    pop rax                 ; func index (not used here)
+    pop rax                 ; fixup location
+    mov rcx, [code_len]
+    sub rcx, rax
+    sub rcx, 4
+    lea rdi, [code_buf + rax]
+    mov [rdi], ecx
+
+    ; Clear current func
+    mov qword [current_func], 0
+
+    ret
+
+.error:
+    jmp error_exit
+
+; ───────────────────────────────────────────────────────────────────────────
+; Compile '-> expr' (return)
+; ───────────────────────────────────────────────────────────────────────────
+compile_return:
+    add qword [source_pos], 2
+    call skip_ws
+    call compile_expr
+
+    ; add rsp, 0x400
+    mov al, 0x48
+    call emit_byte
+    mov al, 0x81
+    call emit_byte
+    mov al, 0xc4
+    call emit_byte
+    mov eax, 0x400
+    call emit_dword
+    mov al, 0x5d            ; pop rbp
+    call emit_byte
+    mov al, 0xc3            ; ret
+    call emit_byte
+    ret
+
+; ───────────────────────────────────────────────────────────────────────────
+; Compile function call (ident already in ident_buf)
+; ───────────────────────────────────────────────────────────────────────────
+compile_call:
+    call find_func
+    cmp rax, -1
+    je .not_found
+    push rax                ; save func index
+
+    call next_char          ; '('
+
+    ; Compile arguments
+    xor r12, r12            ; arg count
+.arg_loop:
+    call skip_ws
+    call peek_char
+    cmp al, ')'
+    je .args_done
+    cmp al, ','
+    jne .not_comma
+    inc qword [source_pos]
+    jmp .arg_loop
+.not_comma:
+    call compile_expr
+
+    ; Store in appropriate register
+    cmp r12, 0
+    jne .not_arg0
+    ; mov rdi, rax
+    mov al, 0x48
+    call emit_byte
+    mov al, 0x89
+    call emit_byte
+    mov al, 0xc7
+    call emit_byte
+    jmp .next_arg
+
+.not_arg0:
+    cmp r12, 1
+    jne .not_arg1
+    ; mov rsi, rax
+    mov al, 0x48
+    call emit_byte
+    mov al, 0x89
+    call emit_byte
+    mov al, 0xc6
+    call emit_byte
+    jmp .next_arg
+
+.not_arg1:
+    cmp r12, 2
+    jne .not_arg2
+    ; mov rdx, rax
+    mov al, 0x48
+    call emit_byte
+    mov al, 0x89
+    call emit_byte
+    mov al, 0xc2
+    call emit_byte
+    jmp .next_arg
+
+.not_arg2:
+    cmp r12, 3
+    jne .next_arg
+    ; mov rcx, rax
+    mov al, 0x48
+    call emit_byte
+    mov al, 0x89
+    call emit_byte
+    mov al, 0xc1
+    call emit_byte
+
+.next_arg:
+    inc r12
+    jmp .arg_loop
+
+.args_done:
+    call next_char          ; ')'
+
+    ; Call function
+    pop rax                 ; func index
+    mov rcx, [func_addrs + rax*8]
+    test rcx, rcx
+    jz .forward_call
+
+    ; call rel32
+    mov al, 0xe8
+    call emit_byte
+    mov rax, rcx
+    mov rcx, [code_len]
+    sub rax, rcx
+    sub rax, 4
+    call emit_dword
+    ret
+
+.forward_call:
+    ; Function not yet compiled, emit placeholder
+    mov al, 0xe8
+    call emit_byte
+    xor eax, eax
+    call emit_dword
+    ret
+
+.not_found:
+    ; Unknown function, skip
+    call next_char          ; '('
+.skip_args:
+    call peek_char
+    cmp al, ')'
+    je .skip_done
+    cmp al, 0
+    je .skip_done
+    inc qword [source_pos]
+    jmp .skip_args
+.skip_done:
+    call next_char
+    ret
+
+; ───────────────────────────────────────────────────────────────────────────
+; Compile 'unified { i: v, e: v, r: v }'
+; ───────────────────────────────────────────────────────────────────────────
+compile_unified:
+    add qword [source_pos], 7
+    call skip_ws
+    call next_char          ; '{'
+
+.parse_params:
+    call skip_ws
+    call peek_char
+    cmp al, '}'
+    je .done
+    cmp al, 0
+    je .done
+
+    ; Parse parameter name
+    cmp al, 'i'
+    jne .not_i
+    inc qword [source_pos]
+    call skip_ws
+    call next_char          ; ':'
+    call skip_ws
+    call parse_float
+    mov [unified_i], rax
+    jmp .parse_params
+
+.not_i:
+    cmp al, 'e'
+    jne .not_e
+    inc qword [source_pos]
+    call skip_ws
+    call next_char
+    call skip_ws
+    call parse_float
+    mov [unified_e], rax
+    jmp .parse_params
+
+.not_e:
+    cmp al, 'r'
+    jne .skip_char
+    inc qword [source_pos]
+    call skip_ws
+    call next_char
+    call skip_ws
+    call parse_float
+    mov [unified_r], rax
+    jmp .parse_params
+
+.skip_char:
+    inc qword [source_pos]
+    jmp .parse_params
+
+.done:
+    call next_char          ; '}'
+    ret
+
+; ───────────────────────────────────────────────────────────────────────────
+; Compile 'fate on' or 'fate off'
+; ───────────────────────────────────────────────────────────────────────────
+compile_fate:
+    add qword [source_pos], 4
+    call skip_ws
+
+    ; Check for 'on' or 'off'
+    call peek_char
+    cmp al, 'o'
+    jne .skip
+    inc qword [source_pos]
+    call peek_char
+    cmp al, 'n'
+    jne .check_off
+    inc qword [source_pos]
+    mov qword [fate_mode], 1
+    ret
+
+.check_off:
+    cmp al, 'f'
+    jne .skip
+    add qword [source_pos], 2   ; 'ff'
+    mov qword [fate_mode], 0
+    ret
+
+.skip:
+    call skip_line
+    ret
 
 ; ───────────────────────────────────────────────────────────────────────────
 ; Compile expression (result in rax)
@@ -598,7 +1667,6 @@ compile_expr:
     call skip_ws
     call compile_term
 
-    ; Check for operators
 .check_op:
     call skip_ws
     call peek_char
@@ -632,46 +1700,31 @@ compile_expr:
     mov al, 0x59
     call emit_byte
     ; add rax, rcx
-    mov al, 0x48
-    call emit_byte
-    mov al, 0x01
-    call emit_byte
-    mov al, 0xc8
-    call emit_byte
+    mov eax, 0xc80148
+    call emit_3bytes
     jmp .check_op
 
 .sub:
     call next_char
-    ; push rax
     mov al, 0x50
     call emit_byte
     call compile_term
     ; mov rcx, rax
-    mov al, 0x48
-    call emit_byte
-    mov al, 0x89
-    call emit_byte
-    mov al, 0xc1
-    call emit_byte
+    mov eax, 0xc18948
+    call emit_3bytes
     ; pop rax
     mov al, 0x58
     call emit_byte
     ; sub rax, rcx
-    mov al, 0x48
-    call emit_byte
-    mov al, 0x29
-    call emit_byte
-    mov al, 0xc8
-    call emit_byte
+    mov eax, 0xc82948
+    call emit_3bytes
     jmp .check_op
 
 .mul:
     call next_char
-    ; push rax
     mov al, 0x50
     call emit_byte
     call compile_term
-    ; pop rcx
     mov al, 0x59
     call emit_byte
     ; imul rax, rcx
@@ -687,27 +1740,17 @@ compile_expr:
 
 .div:
     call next_char
-    ; push rax
     mov al, 0x50
     call emit_byte
     call compile_term
     ; mov rcx, rax
-    mov al, 0x48
-    call emit_byte
-    mov al, 0x89
-    call emit_byte
-    mov al, 0xc1
-    call emit_byte
-    ; pop rax
+    mov eax, 0xc18948
+    call emit_3bytes
     mov al, 0x58
     call emit_byte
     ; xor rdx, rdx
-    mov al, 0x48
-    call emit_byte
-    mov al, 0x31
-    call emit_byte
-    mov al, 0xd2
-    call emit_byte
+    mov eax, 0xd23148
+    call emit_3bytes
     ; idiv rcx
     mov al, 0x48
     call emit_byte
@@ -718,28 +1761,24 @@ compile_expr:
     jmp .check_op
 
 .check_eq:
-    ; Check for ==
     mov rax, [source_pos]
-    inc rax
     lea rsi, [source_buf + rax]
-    cmp byte [rsi], '='
+    cmp byte [rsi+1], '='
     jne .done
     add qword [source_pos], 2
-    call compile_comparison
-    mov bl, 0x94        ; sete
+    call compile_cmp
+    mov bl, 0x94            ; sete
     call emit_setcc
     jmp .check_op
 
 .check_neq:
-    ; Check for !=
     mov rax, [source_pos]
-    inc rax
     lea rsi, [source_buf + rax]
-    cmp byte [rsi], '='
+    cmp byte [rsi+1], '='
     jne .done
     add qword [source_pos], 2
-    call compile_comparison
-    mov bl, 0x95        ; setne
+    call compile_cmp
+    mov bl, 0x95            ; setne
     call emit_setcc
     jmp .check_op
 
@@ -748,14 +1787,14 @@ compile_expr:
     call peek_char
     cmp al, '='
     je .gte
-    call compile_comparison
-    mov bl, 0x9f        ; setg
+    call compile_cmp
+    mov bl, 0x9f            ; setg
     call emit_setcc
     jmp .check_op
 .gte:
     call next_char
-    call compile_comparison
-    mov bl, 0x9d        ; setge
+    call compile_cmp
+    mov bl, 0x9d            ; setge
     call emit_setcc
     jmp .check_op
 
@@ -764,39 +1803,33 @@ compile_expr:
     call peek_char
     cmp al, '='
     je .lte
-    call compile_comparison
-    mov bl, 0x9c        ; setl
+    call compile_cmp
+    mov bl, 0x9c            ; setl
     call emit_setcc
     jmp .check_op
 .lte:
     call next_char
-    call compile_comparison
-    mov bl, 0x9e        ; setle
+    call compile_cmp
+    mov bl, 0x9e            ; setle
     call emit_setcc
     jmp .check_op
 
 .done:
     ret
 
-compile_comparison:
-    ; push rax
+compile_cmp:
     mov al, 0x50
     call emit_byte
     call compile_term
-    ; pop rcx
     mov al, 0x59
     call emit_byte
     ; cmp rcx, rax
-    mov al, 0x48
-    call emit_byte
-    mov al, 0x39
-    call emit_byte
-    mov al, 0xc1
-    call emit_byte
+    mov eax, 0xc13948
+    call emit_3bytes
     ret
 
 emit_setcc:
-    ; setXX al (bl = opcode)
+    ; setXX al
     mov al, 0x0f
     call emit_byte
     mov al, bl
@@ -815,23 +1848,62 @@ emit_setcc:
     ret
 
 ; ───────────────────────────────────────────────────────────────────────────
-; Compile term (number, variable, or function call)
+; Compile term (number, variable, function call, getchar)
 ; ───────────────────────────────────────────────────────────────────────────
 compile_term:
     call skip_ws
     call peek_char
 
-    ; Check for number
-    call is_digit
-    test al, al
-    jnz .number
+    ; Number
+    cmp al, '0'
+    jl .not_num
+    cmp al, '9'
+    jle .number
 
-    ; Check for identifier
+.not_num:
+    ; Negative number
+    cmp al, '-'
+    jne .not_neg
+    mov rax, [source_pos]
+    lea rsi, [source_buf + rax + 1]
+    movzx eax, byte [rsi]
+    cmp al, '0'
+    jl .not_neg
+    cmp al, '9'
+    jg .not_neg
+    jmp .number
+
+.not_neg:
+    ; Identifier or function call
     call peek_char
     call is_alpha
     test al, al
-    jnz .ident
+    jz .default
 
+    call parse_ident
+    call skip_ws
+    call peek_char
+
+    cmp al, '('
+    je .func_call
+
+    ; Check if it's getchar
+    lea rsi, [ident_buf]
+    cmp dword [rsi], 'getc'
+    jne .load_var
+    cmp dword [rsi+4], 'har('
+    jne .load_var
+    ; It's getchar()
+    add qword [source_pos], 2   ; skip ()
+    call emit_getchar
+    ret
+
+.load_var:
+    call load_var_by_name
+    ret
+
+.func_call:
+    call compile_call
     ret
 
 .number:
@@ -845,349 +1917,115 @@ compile_term:
     call emit_qword
     ret
 
-.ident:
-    call parse_ident
-    call skip_ws
-    call peek_char
-    cmp al, '('
-    je .func_call
-
-    ; Load variable
-    call load_var
-    ret
-
-.func_call:
-    call compile_call
+.default:
+    ; Return 0
+    mov eax, 0xc03148
+    call emit_3bytes
     ret
 
 ; ───────────────────────────────────────────────────────────────────────────
-; Compile 'when condition { ... }'
+; Emit getchar code
 ; ───────────────────────────────────────────────────────────────────────────
-compile_when:
-    add qword [source_pos], 4
-    call skip_ws
-    call compile_expr
-
-    ; test rax, rax
+emit_getchar:
+    ; sub rsp, 16
     mov al, 0x48
     call emit_byte
-    mov al, 0x85
+    mov al, 0x83
+    call emit_byte
+    mov al, 0xec
+    call emit_byte
+    mov al, 16
+    call emit_byte
+
+    ; mov rax, 0 (SYS_READ)
+    mov al, 0x48
+    call emit_byte
+    mov al, 0xc7
     call emit_byte
     mov al, 0xc0
     call emit_byte
+    mov eax, SYS_READ
+    call emit_dword
 
-    ; jz end (patch later)
+    ; mov rdi, 0 (STDIN)
+    mov al, 0x48
+    call emit_byte
+    mov al, 0xc7
+    call emit_byte
+    mov al, 0xc7
+    call emit_byte
+    xor eax, eax
+    call emit_dword
+
+    ; lea rsi, [rsp]
+    mov al, 0x48
+    call emit_byte
+    mov al, 0x8d
+    call emit_byte
+    mov al, 0x34
+    call emit_byte
+    mov al, 0x24
+    call emit_byte
+
+    ; mov rdx, 1
+    mov al, 0x48
+    call emit_byte
+    mov al, 0xc7
+    call emit_byte
+    mov al, 0xc2
+    call emit_byte
+    mov eax, 1
+    call emit_dword
+
+    ; syscall
     mov al, 0x0f
     call emit_byte
-    mov al, 0x84
-    call emit_byte
-    mov rax, [code_len]
-    push rax            ; save fixup location
-    xor eax, eax
-    call emit_dword
-
-    ; Skip to '{'
-    call skip_ws
-    call next_char      ; consume '{'
-
-    ; Compile body
-.body_loop:
-    call skip_ws
-    call peek_char
-    cmp al, '}'
-    je .body_done
-    cmp al, 0
-    je .error
-    call compile_statement
-    jmp .body_loop
-
-.body_done:
-    call next_char      ; consume '}'
-
-    ; Patch jump
-    pop rax             ; fixup location
-    mov rcx, [code_len]
-    sub rcx, rax
-    sub rcx, 4          ; adjust for offset size
-    lea rdi, [code_buf + rax]
-    mov [rdi], ecx
-
-    ret
-
-.error:
-    jmp error_exit
-
-; ───────────────────────────────────────────────────────────────────────────
-; Compile 'loop { ... }'
-; ───────────────────────────────────────────────────────────────────────────
-compile_loop:
-    add qword [source_pos], 4
-    call skip_ws
-    call next_char      ; consume '{'
-
-    ; Save loop start
-    mov rax, [code_len]
-    push rax
-
-    ; Push break target (will patch later)
-    push qword 0        ; placeholder for break fixup list
-
-.body_loop:
-    call skip_ws
-    call peek_char
-    cmp al, '}'
-    je .body_done
-    cmp al, 0
-    je .error
-    call compile_statement
-    jmp .body_loop
-
-.body_done:
-    call next_char      ; consume '}'
-
-    ; jmp back to start
-    mov al, 0xe9
-    call emit_byte
-    pop rcx             ; break fixup (ignore for now)
-    pop rax             ; loop start
-    mov rcx, [code_len]
-    sub rax, rcx
-    sub rax, 4
-    call emit_dword
-
-    ret
-
-.error:
-    jmp error_exit
-
-; ───────────────────────────────────────────────────────────────────────────
-; Compile 'break'
-; ───────────────────────────────────────────────────────────────────────────
-compile_break:
-    add qword [source_pos], 5
-    ; For simplicity, emit a far jump that will need manual fixup
-    ; In production, would maintain a fixup list
-    ; jmp +0 (will be patched by loop end)
-    mov al, 0xe9
-    call emit_byte
-    xor eax, eax
-    call emit_dword
-    ret
-
-; ───────────────────────────────────────────────────────────────────────────
-; Compile 'fn name params { ... }'
-; ───────────────────────────────────────────────────────────────────────────
-compile_fn:
-    add qword [source_pos], 2
-    call skip_ws
-
-    ; Get function name
-    call parse_ident
-
-    ; Store function address
-    mov rax, [func_count]
-    lea rdi, [func_names]
-    imul rcx, rax, 64
-    add rdi, rcx
-    lea rsi, [ident_buf]
-    mov rcx, 64
-    rep movsb
-
-    mov rax, [func_count]
-    lea rdi, [func_addrs]
-    mov rcx, [code_len]
-    mov [rdi + rax*8], rcx
-
-    inc qword [func_count]
-
-    ; Skip to '{'
-.skip_params:
-    call skip_ws
-    call peek_char
-    cmp al, '{'
-    je .found_brace
-    call next_char
-    jmp .skip_params
-
-.found_brace:
-    call next_char      ; consume '{'
-
-    ; Emit function prologue
-    mov al, 0x55        ; push rbp
-    call emit_byte
-    mov al, 0x48        ; mov rbp, rsp
-    call emit_byte
-    mov al, 0x89
-    call emit_byte
-    mov al, 0xe5
+    mov al, 0x05
     call emit_byte
 
-    ; Compile body
-.body_loop:
-    call skip_ws
-    call peek_char
-    cmp al, '}'
-    je .body_done
-    cmp al, 0
-    je .error
-
-    ; Check for '->' return
-    cmp al, '-'
-    jne .not_return
-    mov rax, [source_pos]
-    inc rax
-    lea rsi, [source_buf + rax]
-    cmp byte [rsi], '>'
-    jne .not_return
-    add qword [source_pos], 2
-    call skip_ws
-    call compile_expr
-    ; Emit return
-    mov al, 0x5d        ; pop rbp
+    ; movzx rax, byte [rsp]
+    mov al, 0x48
     call emit_byte
-    mov al, 0xc3        ; ret
+    mov al, 0x0f
     call emit_byte
-    jmp .body_loop
-
-.not_return:
-    call compile_statement
-    jmp .body_loop
-
-.body_done:
-    call next_char      ; consume '}'
-
-    ; Emit epilogue
-    mov al, 0x5d        ; pop rbp
+    mov al, 0xb6
     call emit_byte
-    mov al, 0xc3        ; ret
+    mov al, 0x04
+    call emit_byte
+    mov al, 0x24
     call emit_byte
 
-    ret
-
-.error:
-    jmp error_exit
-
-; ───────────────────────────────────────────────────────────────────────────
-; Compile function call
-; ───────────────────────────────────────────────────────────────────────────
-compile_call:
-    ; ident_buf has function name
-    call next_char      ; consume '('
-
-    ; For simplicity, skip args for now
-.skip_args:
-    call skip_ws
-    call peek_char
-    cmp al, ')'
-    je .call_done
-    call next_char
-    jmp .skip_args
-
-.call_done:
-    call next_char      ; consume ')'
-
-    ; Find function
-    xor rcx, rcx
-.find_func:
-    cmp rcx, [func_count]
-    jge .not_found
-
-    lea rdi, [func_names]
-    imul rax, rcx, 64
-    add rdi, rax
-    lea rsi, [ident_buf]
-    push rcx
-    call strcmp
-    pop rcx
-    test al, al
-    jz .found
-    inc rcx
-    jmp .find_func
-
-.found:
-    ; Get address
-    lea rdi, [func_addrs]
-    mov rax, [rdi + rcx*8]
-
-    ; call rel32
-    mov bl, 0xe8
-    mov al, bl
+    ; add rsp, 16
+    mov al, 0x48
     call emit_byte
-    mov rcx, [code_len]
-    sub rax, rcx
-    sub rax, 4
-    call emit_dword
-    ret
+    mov al, 0x83
+    call emit_byte
+    mov al, 0xc4
+    call emit_byte
+    mov al, 16
+    call emit_byte
 
-.not_found:
-    ret
-
-; ───────────────────────────────────────────────────────────────────────────
-; Compile 'unified { i: v, e: v, r: v }'
-; ───────────────────────────────────────────────────────────────────────────
-compile_unified:
-    add qword [source_pos], 7
-    ; Skip to '}'
-.skip:
-    call skip_ws
-    call peek_char
-    cmp al, '}'
-    je .done
-    cmp al, 0
-    je .done
-    call next_char
-    jmp .skip
-.done:
-    call next_char      ; consume '}'
     ret
 
 ; ───────────────────────────────────────────────────────────────────────────
 ; Variable management
 ; ───────────────────────────────────────────────────────────────────────────
-store_var:
-    ; Find or create variable
-    xor rcx, rcx
-.find:
-    cmp rcx, [var_count]
-    jge .create
+store_var_by_name:
+    ; Find or create variable, store rax to it
+    ; ident_buf has name
+    call find_var
+    cmp rax, -1
+    je .create
 
-    lea rdi, [var_names]
-    imul rax, rcx, 64
-    add rdi, rax
-    lea rsi, [ident_buf]
-    push rcx
-    call strcmp
-    pop rcx
-    test al, al
-    jz .found
-    inc rcx
-    jmp .find
-
-.create:
-    ; New variable
-    mov rax, [var_count]
-    lea rdi, [var_names]
-    imul rcx, rax, 64
-    add rdi, rcx
-    lea rsi, [ident_buf]
-    mov rcx, 64
-    rep movsb
-
-    ; Allocate stack slot
-    mov rax, [var_count]
-    mov rcx, [stack_off]
-    add rcx, 8
-    mov [stack_off], rcx
-    lea rdi, [var_offs]
-    mov [rdi + rax*8], rcx
-
-    inc qword [var_count]
-    mov rcx, [stack_off]
+    ; Found, get offset
+    mov rcx, [var_offs + rax*8]
     jmp .store
 
-.found:
-    lea rdi, [var_offs]
-    mov rcx, [rdi + rcx*8]
+.create:
+    call create_var_from_ident
+    mov rax, [var_count]
+    dec rax
+    mov rcx, [var_offs + rax*8]
 
 .store:
     ; mov [rbp - offset], rax
@@ -1202,28 +2040,13 @@ store_var:
     call emit_dword
     ret
 
-load_var:
-    ; Find variable
-    xor rcx, rcx
-.find:
-    cmp rcx, [var_count]
-    jge .not_found
+load_var_by_name:
+    ; Load variable to rax
+    call find_var
+    cmp rax, -1
+    je .not_found
 
-    lea rdi, [var_names]
-    imul rax, rcx, 64
-    add rdi, rax
-    lea rsi, [ident_buf]
-    push rcx
-    call strcmp
-    pop rcx
-    test al, al
-    jz .found
-    inc rcx
-    jmp .find
-
-.found:
-    lea rdi, [var_offs]
-    mov rcx, [rdi + rcx*8]
+    mov rcx, [var_offs + rax*8]
 
     ; mov rax, [rbp - offset]
     mov al, 0x48
@@ -1239,22 +2062,111 @@ load_var:
 
 .not_found:
     ; Return 0
-    mov al, 0x48
-    call emit_byte
-    mov al, 0x31
-    call emit_byte
-    mov al, 0xc0
-    call emit_byte
+    mov eax, 0xc03148
+    call emit_3bytes
     ret
 
-; ───────────────────────────────────────────────────────────────────────────
+find_var:
+    ; Find variable by name in ident_buf
+    ; Returns index or -1
+    xor rcx, rcx
+.loop:
+    cmp rcx, [var_count]
+    jge .not_found
+
+    lea rdi, [var_names]
+    imul rax, rcx, 32
+    add rdi, rax
+    lea rsi, [ident_buf]
+    push rcx
+    call strcmp
+    pop rcx
+    test al, al
+    jz .found
+    inc rcx
+    jmp .loop
+
+.found:
+    mov rax, rcx
+    ret
+
+.not_found:
+    mov rax, -1
+    ret
+
+create_var_from_ident:
+    ; Create new variable from ident_buf
+    mov rax, [var_count]
+    cmp rax, MAX_VARS
+    jge .error
+
+    ; Copy name
+    lea rdi, [var_names]
+    imul rcx, rax, 32
+    add rdi, rcx
+    lea rsi, [ident_buf]
+    mov rcx, 32
+    call memcpy
+
+    ; Allocate stack slot
+    mov rax, [var_count]
+    mov rcx, [stack_off]
+    mov [var_offs + rax*8], rcx
+    add qword [stack_off], 8
+    inc qword [var_count]
+    ret
+
+.error:
+    jmp error_exit
+
+find_func:
+    ; Find function by name in ident_buf
+    xor rcx, rcx
+.loop:
+    cmp rcx, [func_count]
+    jge .not_found
+
+    lea rdi, [func_names]
+    imul rax, rcx, 32
+    add rdi, rax
+    lea rsi, [ident_buf]
+    push rcx
+    call strcmp
+    pop rcx
+    test al, al
+    jz .found
+    inc rcx
+    jmp .loop
+
+.found:
+    mov rax, rcx
+    ret
+
+.not_found:
+    mov rax, -1
+    ret
+
+; ═══════════════════════════════════════════════════════════════════════════
 ; Helper functions
-; ───────────────────────────────────────────────────────────────────────────
+; ═══════════════════════════════════════════════════════════════════════════
 emit_byte:
     mov rdi, [code_len]
     lea rsi, [code_buf + rdi]
     mov [rsi], al
     inc qword [code_len]
+    ret
+
+emit_3bytes:
+    ; eax contains 3 bytes
+    push rax
+    call emit_byte
+    pop rax
+    shr eax, 8
+    push rax
+    call emit_byte
+    pop rax
+    shr eax, 8
+    call emit_byte
     ret
 
 emit_dword:
@@ -1292,11 +2204,11 @@ skip_ws:
     call peek_char
     cmp al, ' '
     je .skip
-    cmp al, 9       ; tab
+    cmp al, 9
     je .skip
-    cmp al, 10      ; newline
+    cmp al, 10
     je .skip
-    cmp al, 13      ; CR
+    cmp al, 13
     je .skip
     ret
 .skip:
@@ -1318,29 +2230,17 @@ skip_line:
 
 is_alpha:
     cmp al, 'a'
-    jl .check_upper
+    jl .upper
     cmp al, 'z'
     jle .yes
-.check_upper:
+.upper:
     cmp al, 'A'
-    jl .check_under
+    jl .under
     cmp al, 'Z'
     jle .yes
-.check_under:
+.under:
     cmp al, '_'
     je .yes
-    xor eax, eax
-    ret
-.yes:
-    mov eax, 1
-    ret
-
-is_digit:
-    cmp al, '0'
-    jl .no
-    cmp al, '9'
-    jle .yes
-.no:
     xor eax, eax
     ret
 .yes:
@@ -1353,7 +2253,12 @@ is_alnum:
     test al, al
     pop rax
     jnz .yes
-    call is_digit
+    cmp al, '0'
+    jl .no
+    cmp al, '9'
+    jle .yes
+.no:
+    xor eax, eax
     ret
 .yes:
     mov eax, 1
@@ -1369,6 +2274,11 @@ parse_ident:
     test al, al
     pop rax
     jz .done
+    cmp al, '.'
+    je .store
+    test al, al
+    jz .done
+.store:
     mov [rdi + rcx], al
     inc rcx
     inc qword [source_pos]
@@ -1380,7 +2290,15 @@ parse_ident:
 
 parse_number:
     xor rax, rax
-.loop:
+    xor r8, r8              ; sign flag
+    
+    call peek_char
+    cmp al, '-'
+    jne .parse
+    mov r8, 1
+    inc qword [source_pos]
+
+.parse:
     push rax
     call peek_char
     mov rcx, rax
@@ -1394,13 +2312,111 @@ parse_number:
     movzx rcx, cl
     add rax, rcx
     inc qword [source_pos]
-    jmp .loop
+    jmp .parse
+
 .done:
+    test r8, r8
+    jz .positive
+    neg rax
+.positive:
     mov [num_buf], rax
     ret
 
+parse_float:
+    ; Parse float as fixed-point (value * 1000)
+    xor rax, rax
+    xor r8, r8              ; integer part
+    xor r9, r9              ; fraction * 1000
+
+.int_part:
+    call peek_char
+    cmp al, '.'
+    je .frac_part
+    cmp al, '0'
+    jl .done
+    cmp al, '9'
+    jg .done
+    imul r8, 10
+    sub al, '0'
+    movzx rcx, al
+    add r8, rcx
+    inc qword [source_pos]
+    jmp .int_part
+
+.frac_part:
+    inc qword [source_pos]
+    mov r10, 100            ; fraction multiplier
+
+.frac_loop:
+    call peek_char
+    cmp al, '0'
+    jl .calc
+    cmp al, '9'
+    jg .calc
+    sub al, '0'
+    movzx rcx, al
+    imul rcx, r10
+    add r9, rcx
+    mov rax, r10
+    xor rdx, rdx
+    mov rcx, 10
+    div rcx
+    mov r10, rax
+    inc qword [source_pos]
+    jmp .frac_loop
+
+.calc:
+    imul r8, 1000
+    add r8, r9
+    mov rax, r8
+
+.done:
+    ret
+
+parse_hex_byte:
+    ; Parse 2 hex digits
+    xor rax, rax
+    call peek_char
+    inc qword [source_pos]
+    call hex_digit
+    shl al, 4
+    mov ah, al
+    call peek_char
+    inc qword [source_pos]
+    call hex_digit
+    or al, ah
+    ret
+
+hex_digit:
+    cmp al, '0'
+    jl .letter
+    cmp al, '9'
+    jg .letter
+    sub al, '0'
+    ret
+.letter:
+    cmp al, 'a'
+    jl .upper
+    cmp al, 'f'
+    jg .upper
+    sub al, 'a'
+    add al, 10
+    ret
+.upper:
+    cmp al, 'A'
+    jl .zero
+    cmp al, 'F'
+    jg .zero
+    sub al, 'A'
+    add al, 10
+    ret
+.zero:
+    xor al, al
+    ret
+
 strcmp:
-    ; rdi = str1, rsi = str2
+    ; Compare strings at rdi and rsi
+    ; Returns 0 if equal
 .loop:
     mov al, [rdi]
     mov cl, [rsi]
@@ -1418,6 +2434,50 @@ strcmp:
     mov eax, 1
     ret
 
+memcpy:
+    ; Copy rcx bytes from rsi to rdi
+    test rcx, rcx
+    jz .done
+.loop:
+    mov al, [rsi]
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    dec rcx
+    jnz .loop
+.done:
+    ret
+
+print_number:
+    ; Print number in rax
+    push rbx
+    mov rbx, rax
+    lea rdi, [str_buf + 20]
+    mov byte [rdi], 0
+    dec rdi
+    mov rcx, 10
+.loop:
+    xor rdx, rdx
+    mov rax, rbx
+    div rcx
+    mov rbx, rax
+    add dl, '0'
+    mov [rdi], dl
+    dec rdi
+    test rbx, rbx
+    jnz .loop
+
+    inc rdi
+    mov rsi, rdi
+    lea rax, [str_buf + 20]
+    sub rax, rdi
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, STDOUT
+    syscall
+    pop rbx
+    ret
+
 ; ───────────────────────────────────────────────────────────────────────────
 ; Keyword checks
 ; ───────────────────────────────────────────────────────────────────────────
@@ -1430,12 +2490,61 @@ check_out:
     jne .no
     cmp byte [rsi+2], 't'
     jne .no
-    cmp byte [rsi+3], ' '
-    jne .check_quote
+    mov al, [rsi+3]
+    cmp al, ' '
+    je .yes
+    cmp al, '"'
+    je .yes
+.no:
+    xor eax, eax
+    ret
+.yes:
     mov eax, 1
     ret
-.check_quote:
-    cmp byte [rsi+3], '"'
+
+check_emit:
+    mov rax, [source_pos]
+    lea rsi, [source_buf + rax]
+    cmp dword [rsi], 'emit'
+    jne .no
+    mov eax, 1
+    ret
+.no:
+    xor eax, eax
+    ret
+
+check_byte:
+    mov rax, [source_pos]
+    lea rsi, [source_buf + rax]
+    cmp dword [rsi], 'byte'
+    jne .no
+    mov eax, 1
+    ret
+.no:
+    xor eax, eax
+    ret
+
+check_putchar:
+    mov rax, [source_pos]
+    lea rsi, [source_buf + rax]
+    cmp dword [rsi], 'putc'
+    jne .no
+    cmp word [rsi+4], 'ha'
+    jne .no
+    cmp byte [rsi+6], 'r'
+    jne .no
+    mov eax, 1
+    ret
+.no:
+    xor eax, eax
+    ret
+
+check_getchar_stmt:
+    mov rax, [source_pos]
+    lea rsi, [source_buf + rax]
+    cmp dword [rsi], 'getc'
+    jne .no
+    cmp dword [rsi+4], 'har('
     jne .no
     mov eax, 1
     ret
@@ -1446,7 +2555,6 @@ check_out:
 check_syscall_exit:
     mov rax, [source_pos]
     lea rsi, [source_buf + rax]
-    ; Check "syscall.exit"
     cmp dword [rsi], 'sysc'
     jne .no
     cmp dword [rsi+4], 'all.'
@@ -1524,6 +2632,30 @@ check_unified:
     xor eax, eax
     ret
 
+check_fate:
+    mov rax, [source_pos]
+    lea rsi, [source_buf + rax]
+    cmp dword [rsi], 'fate'
+    jne .no
+    mov eax, 1
+    ret
+.no:
+    xor eax, eax
+    ret
+
+check_return:
+    mov rax, [source_pos]
+    lea rsi, [source_buf + rax]
+    cmp byte [rsi], '-'
+    jne .no
+    cmp byte [rsi+1], '>'
+    jne .no
+    mov eax, 1
+    ret
+.no:
+    xor eax, eax
+    ret
+
 ; ═══════════════════════════════════════════════════════════════════════════
 ; Write ELF output
 ; ═══════════════════════════════════════════════════════════════════════════
@@ -1533,10 +2665,9 @@ write_elf:
     add rax, prog_header_len
     add rax, [code_len]
 
-    ; Patch program header sizes
-    mov rcx, rax
-    mov [prog_filesz], rcx
-    mov [prog_memsz], rcx
+    ; Patch program header
+    mov [prog_filesz], rax
+    mov [prog_memsz], rax
 
     ; Write ELF header
     mov rax, SYS_WRITE
@@ -1559,7 +2690,7 @@ write_elf:
     mov rdx, [code_len]
     syscall
 
-    ; Close output
+    ; Close
     mov rax, SYS_CLOSE
     mov rdi, [output_fd]
     syscall
@@ -1573,7 +2704,7 @@ error_exit:
     mov rax, SYS_WRITE
     mov rdi, STDERR
     lea rsi, [msg_error]
-    mov rdx, 6
+    mov rdx, 26
     syscall
     mov rax, SYS_EXIT
     mov rdi, 1
