@@ -1,0 +1,338 @@
+// ============================================
+// Wave-ASM Self-Hosting Compiler (written in Wave)
+// Version: 1.0-alpha Bootstrap
+// Author: Rogue Intelligence LNC.
+// ============================================
+// Input: /tmp/input.wave -> Output: /tmp/output.asm
+
+// ---- Unified Field ----
+uf_i = 50
+uf_e = 50
+uf_r = 50
+
+// ---- Global State ----
+src = 0
+pos = 0
+out_fd = 0
+tok_type = 0
+tok_val = 0
+tok_buf = 0
+str_count = 0
+
+fn init {
+    tok_buf = syscall.mmap(0, 256, 3, 0x22, -1, 0)
+    str_count = 0
+}
+
+// ---- Output Helpers ----
+fn out_str s {
+    len = 0
+    loop {
+        when peek(s + len) == 0 { -> 0 }
+        len = len + 1
+    }
+    syscall.write(out_fd, s, len)
+}
+
+fn out_num n {
+    when n == 0 {
+        syscall.write(out_fd, "0", 1)
+        -> 0
+    }
+    buf = syscall.mmap(0, 32, 3, 0x22, -1, 0)
+    i = 0
+    loop {
+        when n == 0 { -> 0 }
+        d = n - n / 10 * 10
+        poke(buf + i, 48 + d)
+        n = n / 10
+        i = i + 1
+    }
+    // Reverse
+    loop {
+        when i == 0 { -> 0 }
+        i = i - 1
+        syscall.write(out_fd, buf + i, 1)
+    }
+}
+
+fn out_nl { syscall.write(out_fd, "\n", 1) }
+
+// ---- String Ops ----
+fn streq a b {
+    i = 0
+    loop {
+        ca = peek(a + i)
+        cb = peek(b + i)
+        when ca != cb { -> 0 }
+        when ca == 0 { -> 1 }
+        i = i + 1
+    }
+}
+
+fn strlen s {
+    n = 0
+    loop {
+        when peek(s + n) == 0 { -> n }
+        n = n + 1
+    }
+}
+
+// ---- File I/O ----
+fn read_src path {
+    fd = syscall.open(path, 0, 0)
+    when fd < 0 {
+        out "Error: cannot open input\n"
+        syscall.exit(1)
+    }
+    buf = syscall.mmap(0, 65536, 3, 0x22, -1, 0)
+    n = syscall.read(fd, buf, 65536)
+    syscall.close(fd)
+    poke(buf + n, 0)
+    -> buf
+}
+
+// ---- Lexer ----
+fn skip_ws {
+    loop {
+        c = peek(src + pos)
+        when c == 32 { pos = pos + 1 }
+        when c == 9 { pos = pos + 1 }
+        when c == 10 { pos = pos + 1 }
+        when c == 13 { pos = pos + 1 }
+        when c == 47 {
+            c2 = peek(src + pos + 1)
+            when c2 == 47 {
+                pos = pos + 2
+                loop {
+                    cc = peek(src + pos)
+                    when cc == 0 { -> 0 }
+                    when cc == 10 { pos = pos + 1 -> 0 }
+                    pos = pos + 1
+                }
+            }
+            when c2 != 47 { -> 0 }
+        }
+        when c != 32 {
+            when c != 9 {
+                when c != 10 {
+                    when c != 13 {
+                        when c != 47 { -> 0 }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn is_alpha c {
+    when c >= 65 { when c <= 90 { -> 1 } }
+    when c >= 97 { when c <= 122 { -> 1 } }
+    when c == 95 { -> 1 }
+    -> 0
+}
+
+fn is_digit c {
+    when c >= 48 { when c <= 57 { -> 1 } }
+    -> 0
+}
+
+fn next_tok {
+    skip_ws()
+    c = peek(src + pos)
+    when c == 0 { tok_type = 0 -> 0 }
+    
+    when is_digit(c) {
+        tok_type = 1
+        tok_val = 0
+        loop {
+            cc = peek(src + pos)
+            when is_digit(cc) == 0 { -> 1 }
+            tok_val = tok_val * 10 + cc - 48
+            pos = pos + 1
+        }
+    }
+    
+    when is_alpha(c) {
+        tok_type = 2
+        i = 0
+        loop {
+            cc = peek(src + pos)
+            a = is_alpha(cc)
+            d = is_digit(cc)
+            when a == 0 {
+                when d == 0 {
+                    poke(tok_buf + i, 0)
+                    -> 2
+                }
+            }
+            poke(tok_buf + i, cc)
+            i = i + 1
+            pos = pos + 1
+        }
+    }
+    
+    when c == 34 {
+        tok_type = 3
+        pos = pos + 1
+        i = 0
+        loop {
+            cc = peek(src + pos)
+            when cc == 34 {
+                pos = pos + 1
+                poke(tok_buf + i, 0)
+                -> 3
+            }
+            when cc == 92 {
+                pos = pos + 1
+                nc = peek(src + pos)
+                when nc == 110 { poke(tok_buf + i, 10) }
+                when nc != 110 { poke(tok_buf + i, nc) }
+            }
+            when cc != 92 { poke(tok_buf + i, cc) }
+            i = i + 1
+            pos = pos + 1
+        }
+    }
+    
+    tok_type = 4
+    tok_val = c
+    pos = pos + 1
+    -> 4
+}
+
+// ---- ASM Emitters ----
+fn emit_header {
+    out_str("; Wave-ASM Bootstrap Output\n")
+    out_str("; Self-Hosting Compiler\n\n")
+    out_str("section .data\n")
+}
+
+fn emit_code_section {
+    out_str("\nsection .text\n")
+    out_str("global _start\n\n")
+    out_str("_start:\n")
+}
+
+fn emit_string s {
+    out_str("    str")
+    out_num(str_count)
+    out_str(": db ")
+    i = 0
+    loop {
+        c = peek(s + i)
+        when c == 0 {
+            out_str(", 0\n")
+            str_count = str_count + 1
+            -> str_count - 1
+        }
+        when i > 0 { out_str(", ") }
+        out_num(c)
+        i = i + 1
+    }
+}
+
+fn emit_exit code {
+    out_str("    mov rax, 60\n")
+    out_str("    mov rdi, ")
+    out_num(code)
+    out_nl()
+    out_str("    syscall\n")
+}
+
+fn emit_write_str idx len {
+    out_str("    mov rax, 1\n")
+    out_str("    mov rdi, 1\n")
+    out_str("    lea rsi, [rel str")
+    out_num(idx)
+    out_str("]\n")
+    out_str("    mov rdx, ")
+    out_num(len)
+    out_nl()
+    out_str("    syscall\n")
+}
+
+// ---- Parse ----
+fn parse_expr {
+    next_tok()
+    when tok_type == 1 {
+        out_str("    mov rax, ")
+        out_num(tok_val)
+        out_nl()
+    }
+    when tok_type == 3 {
+        len = strlen(tok_buf)
+        idx = emit_string(tok_buf)
+        emit_write_str(idx, len)
+    }
+}
+
+fn parse_stmt {
+    next_tok()
+    when tok_type == 0 { -> -1 }
+    
+    when tok_type == 2 {
+        kw = tok_buf
+        // 'out'
+        when peek(kw) == 111 {
+            when peek(kw + 1) == 117 {
+                when peek(kw + 2) == 116 {
+                    parse_expr()
+                    -> 0
+                }
+            }
+        }
+        
+        // 'syscall'
+        when peek(kw) == 115 {
+            when peek(kw + 1) == 121 {
+                next_tok()  // .
+                next_tok()  // exit
+                next_tok()  // (
+                next_tok()  // code
+                code = tok_val
+                next_tok()  // )
+                emit_exit(code)
+                -> 0
+            }
+        }
+        
+        // Variable
+        out_str("    ; var: ")
+        out_str(tok_buf)
+        out_nl()
+    }
+    
+    -> 0
+}
+
+// ---- Compile ----
+fn compile {
+    init()
+    src = read_src("/tmp/input.wave")
+    pos = 0
+    
+    out_fd = syscall.open("/tmp/output.asm", 0x241, 0x1B4)
+    when out_fd < 0 {
+        out "Error: cannot create output\n"
+        syscall.exit(1)
+    }
+    
+    emit_header()
+    emit_code_section()
+    
+    loop {
+        r = parse_stmt()
+        when r < 0 { -> 0 }
+    }
+    
+    syscall.close(out_fd)
+    out "Wave-ASM Bootstrap: /tmp/output.asm\n"
+}
+
+// ---- Main ----
+out "🌊 Wave-ASM Bootstrap Compiler\n"
+out "   Self-Hosting | Rogue Intelligence LNC.\n\n"
+
+compile()
+syscall.exit(0)
